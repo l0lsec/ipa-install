@@ -25,6 +25,63 @@ log()  { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[-]${NC} $1" >&2; exit 1; }
 
+# Verify every external tool the chosen flow needs is installed before we touch
+# the device. Reports ALL missing tools at once with their install commands so
+# the user can fix everything in one pass instead of hitting failures serially.
+check_prereqs() {
+    # Always required: any flow talks to the device via libimobiledevice
+    local required=(
+        "idevice_id|brew install libimobiledevice"
+        "ideviceinstaller|brew install ideviceinstaller"
+        "ideviceinfo|brew install libimobiledevice"
+    )
+
+    # Sign + install paths need the full Apple toolchain
+    if [[ "$JAILBROKEN" != true ]]; then
+        required+=(
+            "ideviceprovision|brew install libimobiledevice"
+            "applesign|npm install -g applesign"
+            "xcodebuild|Install Xcode from the Mac App Store"
+            "codesign|Comes with Xcode Command Line Tools (xcode-select --install)"
+            "security|macOS built-in (should always be present)"
+        )
+    fi
+
+    # Patch flow needs objection to inject the Frida gadget
+    if [[ "$NO_PATCH" != true && "$JAILBROKEN" != true ]]; then
+        required+=("objection|pip3 install objection")
+    fi
+
+    # Attach mode drives objection's REPL post-install
+    if [[ "$ATTACH" == true ]]; then
+        required+=("objection|pip3 install objection")
+    fi
+
+    # Dedupe (e.g. --no-patch --attach would otherwise list objection twice).
+    # Bash 3.2 (default on macOS) has no associative arrays, so use a sentinel.
+    local seen=" "
+    local missing=()
+    for entry in "${required[@]}"; do
+        local tool="${entry%%|*}"
+        local hint="${entry#*|}"
+        [[ "$seen" == *" $tool "* ]] && continue
+        seen+="$tool "
+        if ! command -v "$tool" &>/dev/null; then
+            missing+=("  - $tool   (install: $hint)")
+        fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        local list
+        list=$(printf '%s\n' "${missing[@]}")
+        err "Missing required tools:
+$list
+
+Install them and re-run. See README.md → Prerequisites for details."
+    fi
+    log "All prerequisites present"
+}
+
 JAILBROKEN=false
 NO_PATCH=false
 ATTACH=false
@@ -63,6 +120,8 @@ done
 
 [[ -z "$IPA_PATH" ]] && err "Usage: $0 <path-to-ipa> [options]"
 [[ ! -f "$IPA_PATH" ]] && err "IPA not found: $IPA_PATH"
+
+check_prereqs
 
 log "Checking for connected device..."
 UDID=$(idevice_id -l 2>/dev/null | head -1)
@@ -1067,7 +1126,6 @@ else
         sign_ipa "$PATCHED_IPA" "$OUTPUT_IPA"
     else
         warn "Objection patch output not found, signing original..."
-        warn "(make sure 'applesign' is installed: npm install -g applesign)"
         sign_ipa "$IPA_PATH" "$OUTPUT_IPA"
     fi
 fi

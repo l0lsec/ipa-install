@@ -22,6 +22,17 @@ Automates the IPA patch, sign, and install pipeline for iOS penetration testing.
 
 Once set up, the script auto-generates a provisioning profile matching your team whenever none exists.
 
+**Prereq gate:** every run starts with an upfront check that aborts with a single, actionable message listing every missing tool and its install command. The required set depends on flags:
+
+| Mode                    | Required tools                                                                                                          |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `--jailbroken`          | `idevice_id`, `ideviceinstaller`, `ideviceinfo`                                                                         |
+| `--no-patch`            | The above + `ideviceprovision`, `applesign`, `xcodebuild`, `codesign`, `security`                                       |
+| Default (patch + sign)  | The `--no-patch` set + `objection`                                                                                      |
+| `--attach` (any mode)   | Adds `objection` if not already required                                                                                |
+
+`frida-tools` is pulled in transitively by `objection`, so installing `objection` is sufficient.
+
 ## Directory Layout
 
 ```
@@ -90,10 +101,11 @@ ipa-install/
 
 ## What It Does
 
-1. **Detects device** — confirms an iOS device is connected via USB, grabs its UDID and current iOS version (via `ideviceinfo -k ProductVersion`)
-2. **Extracts bundle ID and minimum OS** — pulls `CFBundleIdentifier` and `MinimumOSVersion` from the IPA's `Info.plist`. If the device's iOS version is older than the app's `MinimumOSVersion` **within the same major release**, sets the patch target automatically (see [MinimumOSVersion Patching](#minimumosversion-patching))
-3. **Auto-detects signing identity and effective team** — finds a valid codesigning identity in your Keychain, then extracts the team ID from **both** the friendly name (`(TEAMID)`) and the cert's `OU` field. On Personal Team accounts these disagree (Apple ID is tied to one team but Xcode generates certs labeled with another). The script prefers the cert `OU` because that's the team Xcode and Apple's developer portal actually recognize, which is what `xcodebuild -allowProvisioningUpdates` needs to succeed
-4. **Auto-detects or auto-generates provisioning profile** (priority-ordered to avoid bundle ID rewriting):
+1. **Checks prerequisites** — verifies every external tool the chosen flow needs (`idevice_id`, `ideviceinstaller`, `ideviceinfo`, plus `ideviceprovision`, `applesign`, `xcodebuild`, `codesign`, `security`, and `objection` depending on flags) is on `PATH` before doing anything. Reports all missing tools at once with install commands and aborts
+2. **Detects device** — confirms an iOS device is connected via USB, grabs its UDID and current iOS version (via `ideviceinfo -k ProductVersion`)
+3. **Extracts bundle ID and minimum OS** — pulls `CFBundleIdentifier` and `MinimumOSVersion` from the IPA's `Info.plist`. If the device's iOS version is older than the app's `MinimumOSVersion` **within the same major release**, sets the patch target automatically (see [MinimumOSVersion Patching](#minimumosversion-patching))
+4. **Auto-detects signing identity and effective team** — finds a valid codesigning identity in your Keychain, then extracts the team ID from **both** the friendly name (`(TEAMID)`) and the cert's `OU` field. On Personal Team accounts these disagree (Apple ID is tied to one team but Xcode generates certs labeled with another). The script prefers the cert `OU` because that's the team Xcode and Apple's developer portal actually recognize, which is what `xcodebuild -allowProvisioningUpdates` needs to succeed
+5. **Auto-detects or auto-generates provisioning profile** (priority-ordered to avoid bundle ID rewriting):
   - Searches both profile directories (Xcode 26 split them):
     - `~/Library/MobileDevice/Provisioning Profiles/`
     - `~/Library/Developer/Xcode/UserData/Provisioning Profiles/`
@@ -102,8 +114,8 @@ ipa-install/
   - **Step 3**: if no covering profile exists, runs `xcodebuild -downloadAllProvisioningProfiles` to pull from Apple, then **auto-generates a fresh profile templated with the IPA's exact bundle ID** by building the bundled stub Xcode project with `xcodebuild -allowProvisioningUpdates`. Xcode/Apple register the App ID under your team automatically — no per-IPA setup
   - **Step 4-6 (fallbacks)**: if per-bundle generation fails (e.g., Apple won't let your team claim that ID), falls back to any usable profile for the team, then any profile across teams, then a stub-bundle auto-gen — all of which trigger the bundle ID rewrite path
   - **Validates the profile covers this device's UDID** — if not, regenerates the profile targeting the connected device so Xcode registers it with the developer portal (preserving the existing bundle ID coverage)
-5. **Patches IPA** — injects Frida gadget via Objection (skipped with `--no-patch` or `--jailbroken`)
-6. **Signs IPA** — tries `applesign`, falls back to manual `codesign` if identity/profile mismatch:
+6. **Patches IPA** — injects Frida gadget via Objection (skipped with `--no-patch` or `--jailbroken`)
+7. **Signs IPA** — tries `applesign`, falls back to manual `codesign` if identity/profile mismatch:
   - Parses the provisioning profile's `application-identifier`
   - If the app's bundle ID doesn't match, **rewrites `CFBundleIdentifier`** to match the profile (handles wildcard, prefix-wildcard, and exact-match profiles)
   - If `--min-os <ver>` was passed, lowers `MinimumOSVersion` in the main `Info.plist` and every framework/plugin `Info.plist` (forces this manual path so applesign can't ship the IPA before patching)
@@ -111,10 +123,10 @@ ipa-install/
   - Extracts entitlements from the profile and applies them during signing
   - Signs frameworks, plugins, and the main bundle in correct order
   - Verifies with `codesign --verify --deep --strict`
-7. **Installs provisioning profile on device** — uses `ideviceprovision install` and lists current profiles
-8. **Installs IPA** — pushes via `ideviceinstaller`
-9. **Saves a copy** — drops the signed IPA at `./<basename>-installed.ipa` in the current working directory for later re-use
-10. **Attaches** — optionally launches Objection REPL against the running app
+8. **Installs provisioning profile on device** — uses `ideviceprovision install` and lists current profiles
+9. **Installs IPA** — pushes via `ideviceinstaller`
+10. **Saves a copy** — drops the signed IPA at `./<basename>-installed.ipa` in the current working directory for later re-use
+11. **Attaches** — optionally launches Objection REPL against the running app
 
 ### Bundle ID Preservation
 
@@ -183,6 +195,7 @@ Implementation notes:
 
 | Error                                                                               | Fix                                                                                                                                                                                                                                                                                                                          |
 | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Missing required tools: ...`                                                       | Upfront prereq gate fired. Install each listed tool with the printed command and re-run; the gate reports every missing tool at once so one pass is enough                                                                                                                                                                   |
 | `No iOS device detected`                                                            | Connect via USB, unlock device, tap "Trust" on the prompt                                                                                                                                                                                                                                                                    |
 | `No signing identity found`                                                         | Open Xcode, sign in to your Apple account, let it generate certs                                                                                                                                                                                                                                                             |
 | `No provisioning profile found`                                                     | Sign Xcode in to your Apple ID (Xcode → Settings → Accounts), then re-run — the script will auto-generate a profile from the bundled stub project                                                                                                                                                                            |
