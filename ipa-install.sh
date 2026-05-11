@@ -13,6 +13,8 @@ set -euo pipefail
 #   --attach             Attach Objection after install
 #   --bundle-id <id>     Override bundle ID for attach (auto-detected from IPA)
 #   --min-os <ver>       Lower MinimumOSVersion in Info.plist (e.g. 15.0)
+#   --no-gadget-config   Skip writing FridaGadget.config.json (auto-enabled on iOS 26+)
+#   --gadget-config <p>  Use a custom FridaGadget.config.json instead of the default
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,6 +32,9 @@ IDENTITY=""
 PROVISION=""
 BUNDLE_ID=""
 MIN_OS=""
+NO_THIN=false
+NO_GADGET_CONFIG=false
+GADGET_CONFIG_PATH=""
 IPA_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -41,8 +46,11 @@ while [[ $# -gt 0 ]]; do
         --provision)   PROVISION="$2"; shift 2 ;;
         --bundle-id)   BUNDLE_ID="$2"; shift 2 ;;
         --min-os)      MIN_OS="$2"; shift 2 ;;
+        --no-thin)     NO_THIN=true; shift ;;
+        --no-gadget-config) NO_GADGET_CONFIG=true; shift ;;
+        --gadget-config) GADGET_CONFIG_PATH="$2"; shift 2 ;;
         -h|--help)
-            sed -n '3,15p' "$0" | sed 's/^# \?//'
+            sed -n '3,17p' "$0" | sed 's/^# \?//'
             exit 0 ;;
         *)
             if [[ -z "$IPA_PATH" ]]; then
@@ -732,6 +740,168 @@ patch_min_os_version() {
     done
 }
 
+# Unzip an IPA, thin its fat Mach-Os to the main exec's arch, drop a
+# FridaGadget.config.json next to the embedded gadget when needed, then rezip.
+# Echoes the path of the processed IPA on stdout. If both passes are skipped
+# / no-op, echoes the original path.
+pre_thin_ipa() {
+    local SOURCE_IPA="$1"
+    if [[ "$NO_THIN" == true && "$NO_GADGET_CONFIG" == true ]]; then
+        echo "$SOURCE_IPA"
+        return 0
+    fi
+    local THINDIR="$WORKDIR/thin_pre"
+    rm -rf "$THINDIR"
+    mkdir -p "$THINDIR"
+    unzip -q "$SOURCE_IPA" -d "$THINDIR" >&2 || { echo "$SOURCE_IPA"; return 0; }
+    local APP_PATH
+    APP_PATH=$(find "$THINDIR/Payload" -maxdepth 1 -name "*.app" | head -1)
+    if [[ -z "$APP_PATH" ]]; then
+        echo "$SOURCE_IPA"
+        return 0
+    fi
+    if [[ "$NO_THIN" != true ]]; then
+        thin_fat_to_main_arch "$APP_PATH" >&2
+    fi
+    if [[ "$NO_GADGET_CONFIG" != true ]]; then
+        write_gadget_config "$APP_PATH" >&2
+    fi
+    local PROCESSED_IPA
+    PROCESSED_IPA="$WORKDIR/$(basename "$SOURCE_IPA" .ipa)-thinned.ipa"
+    ( cd "$THINDIR" && zip -qry "$PROCESSED_IPA" Payload/ ) >&2
+    if [[ -f "$PROCESSED_IPA" ]]; then
+        echo "$PROCESSED_IPA"
+    else
+        echo "$SOURCE_IPA"
+    fi
+}
+
+# Drop a FridaGadget.config.json next to the embedded FridaGadget.dylib.
+# On iOS 26+, Apple tightened JIT-with-debugger restrictions, so a baked-in
+# gadget panics with `brk #1337` during init unless `code_signing` is set to
+# `required` (see https://github.com/frida/frida/issues/3650). We therefore
+# default to required-mode codesigning whenever the device is iOS >= 26 (or
+# unknown). On older iOS the field is harmless. If the user passes a custom
+# config via --gadget-config, that file is copied verbatim instead.
+write_gadget_config() {
+    local APP_PATH="$1"
+    local GADGET_PATH
+    GADGET_PATH=$(find "$APP_PATH/Frameworks" -maxdepth 1 -name "FridaGadget.dylib" 2>/dev/null | head -1)
+    if [[ -z "$GADGET_PATH" ]]; then
+        return 0
+    fi
+    local CFG_PATH="${GADGET_PATH%.dylib}.config.json"
+
+    if [[ -n "$GADGET_CONFIG_PATH" ]]; then
+        if [[ ! -f "$GADGET_CONFIG_PATH" ]]; then
+            warn "--gadget-config file not found: $GADGET_CONFIG_PATH (skipping)"
+            return 0
+        fi
+        cp "$GADGET_CONFIG_PATH" "$CFG_PATH"
+        log "Wrote custom FridaGadget.config.json from $GADGET_CONFIG_PATH"
+        return 0
+    fi
+
+    # Decide whether code_signing must be required. iOS >= 26 always needs it.
+    # If we can't detect the device version, err on the side of including it
+    # (works on every iOS version: pre-26 just ignores the extra field).
+    local NEEDS_REQUIRED=true
+    if [[ -n "${DEVICE_OS:-}" ]]; then
+        local DEV_MAJOR="${DEVICE_OS%%.*}"
+        if [[ "$DEV_MAJOR" =~ ^[0-9]+$ ]] && (( DEV_MAJOR < 26 )); then
+            NEEDS_REQUIRED=false
+        fi
+    fi
+
+    if [[ "$NEEDS_REQUIRED" == true ]]; then
+        cat > "$CFG_PATH" <<'JSON'
+{
+  "interaction": {
+    "type": "listen",
+    "address": "127.0.0.1",
+    "port": 27042,
+    "on_port_conflict": "fail",
+    "on_load": "wait"
+  },
+  "code_signing": "required"
+}
+JSON
+        log "Wrote FridaGadget.config.json with code_signing=required (iOS 26+ workaround for issue #3650)"
+        warn "  -> Interceptor.attach() will be unavailable; ObjC swizzling/replacement still works."
+        warn "  -> For full Interceptor support, sideload --no-patch and run: frida -U -n \"<app name>\" -l script.js"
+    else
+        cat > "$CFG_PATH" <<'JSON'
+{
+  "interaction": {
+    "type": "listen",
+    "address": "127.0.0.1",
+    "port": 27042,
+    "on_port_conflict": "fail",
+    "on_load": "wait"
+  }
+}
+JSON
+        log "Wrote default FridaGadget.config.json (listen on 127.0.0.1:27042)"
+    fi
+}
+
+# Strip every Mach-O in the unpacked .app down to the main executable's arch.
+# Sideloaded apps re-signed with a non-distribution cert frequently crash with
+# `brk #1337` inside an arm64e dylib's initializer because re-signing breaks
+# arm64e pointer-authentication. iOS 17+ on A12+ devices will preferentially
+# load the arm64e slice from a fat third-party dylib whenever it exists, so
+# the safest fix is to thin every fat Mach-O down to the main exec's arch.
+thin_fat_to_main_arch() {
+    local APP_PATH="$1"
+    local APP_BIN="$APP_PATH/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist" 2>/dev/null)"
+    [[ ! -f "$APP_BIN" ]] && APP_BIN=$(find "$APP_PATH" -maxdepth 1 -type f -perm +111 | head -1)
+    [[ ! -f "$APP_BIN" ]] && return 0
+
+    # Determine the main exec's arch(s).
+    local MAIN_ARCHS
+    MAIN_ARCHS=$(lipo -archs "$APP_BIN" 2>/dev/null || echo "")
+    [[ -z "$MAIN_ARCHS" ]] && return 0
+
+    # Pick the first arch (usually arm64). If main is arm64e (rare for sideload
+    # targets), keep arm64e. Otherwise prefer arm64.
+    local TARGET_ARCH
+    if [[ " $MAIN_ARCHS " == *" arm64 "* ]]; then
+        TARGET_ARCH="arm64"
+    else
+        TARGET_ARCH="${MAIN_ARCHS%% *}"
+    fi
+    log "Thinning fat Mach-Os in app bundle to $TARGET_ARCH (main exec is: $MAIN_ARCHS)"
+
+    local thinned=0
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        # Cheap Mach-O / fat detection: read first 4 bytes.
+        local magic
+        magic=$(xxd -p -l 4 "$f" 2>/dev/null || true)
+        # Fat magic numbers: cafebabe, bebafeca (little-endian), cafebabf (fat64), bfbafeca
+        case "$magic" in
+            cafebabe|bebafeca|cafebabf|bfbafeca) ;;
+            *) continue ;;
+        esac
+        # Confirm with lipo and skip if it's already thin or arch missing.
+        local archs
+        archs=$(lipo -archs "$f" 2>/dev/null || echo "")
+        [[ -z "$archs" ]] && continue
+        [[ " $archs " != *" $TARGET_ARCH "* ]] && continue
+        # If only target arch is present, lipo -thin would be a no-op or fail.
+        if [[ "$archs" == "$TARGET_ARCH" ]]; then
+            continue
+        fi
+        if lipo "$f" -thin "$TARGET_ARCH" -output "$f.thin" 2>/dev/null; then
+            mv "$f.thin" "$f"
+            thinned=$((thinned + 1))
+        fi
+    done < <(find "$APP_PATH/Frameworks" "$APP_PATH/PlugIns" -type f \
+                  \( -name "*.dylib" -o -perm +111 \) 2>/dev/null)
+
+    log "Thinned $thinned fat Mach-O(s) to $TARGET_ARCH"
+}
+
 sign_ipa() {
     local SOURCE_IPA="$1"
     local DEST_IPA="$2"
@@ -853,14 +1023,51 @@ if [[ "$NO_PATCH" == true ]]; then
     sign_ipa "$IPA_PATH" "$OUTPUT_IPA"
 else
     log "Patching IPA with Frida gadget..."
-    PATCHED_IPA="$WORKDIR/${BASENAME}-frida-codesigned.ipa"
-    objection patchipa --source "$IPA_PATH" --codesign-signature "$IDENTITY" -o "$PATCHED_IPA" || true
+    # objection patchipa has no -o flag; it writes
+    # "<source-stem>-frida-codesigned.ipa" into the current working directory.
+    # Run it from $WORKDIR so the output lands there.
+    PATCH_OUTDIR="$WORKDIR/objection_out"
+    mkdir -p "$PATCH_OUTDIR"
+    PATCHED_IPA="$PATCH_OUTDIR/${BASENAME}-frida-codesigned.ipa"
+
+    OBJECTION_ARGS=(
+        patchipa
+        --source "$IPA_PATH"
+        --codesign-signature "$IDENTITY"
+    )
+    if [[ -n "$PROVISION" && -f "$PROVISION" ]]; then
+        OBJECTION_ARGS+=(--provision-file "$PROVISION")
+    fi
+    if [[ -n "$BUNDLE_ID" ]]; then
+        OBJECTION_ARGS+=(--bundle-id "$BUNDLE_ID")
+    fi
+
+    set +e
+    ( cd "$PATCH_OUTDIR" && objection "${OBJECTION_ARGS[@]}" )
+    OBJ_RC=$?
+    set -e
+
+    if [[ $OBJ_RC -ne 0 ]]; then
+        warn "objection patchipa exited with code $OBJ_RC"
+    fi
+
+    # Some objection versions sanitise spaces in the output filename. Pick the
+    # newest *-frida-codesigned.ipa in the output dir as a fallback.
+    if [[ ! -f "$PATCHED_IPA" ]]; then
+        FOUND_IPA=$(ls -1t "$PATCH_OUTDIR"/*-frida-codesigned.ipa 2>/dev/null | head -1 || true)
+        if [[ -n "$FOUND_IPA" && -f "$FOUND_IPA" ]]; then
+            PATCHED_IPA="$FOUND_IPA"
+        fi
+    fi
 
     if [[ -f "$PATCHED_IPA" ]]; then
+        log "Pre-processing patched IPA (thin arm64e + write gadget config)..."
+        PATCHED_IPA=$(pre_thin_ipa "$PATCHED_IPA")
         log "Re-signing patched IPA..."
         sign_ipa "$PATCHED_IPA" "$OUTPUT_IPA"
     else
         warn "Objection patch output not found, signing original..."
+        warn "(make sure 'applesign' is installed: npm install -g applesign)"
         sign_ipa "$IPA_PATH" "$OUTPUT_IPA"
     fi
 fi
